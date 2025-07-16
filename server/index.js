@@ -8,7 +8,7 @@ const authRoutes = require('./routes/authRoutes');
 const contactRoutes = require('./routes/contactRoutes');
 const profileRoutes = require('./routes/ProfileRoutes'); 
 const productSearchRoutes = require('./routes/productSearchRoutes');
-
+const selectionRoutes = require('./routes/selections');
 
 
 const app = express();
@@ -21,14 +21,15 @@ app.use(cors({
 app.use(express.json());
 
 // === Serve uploaded images from /uploads ===
-app.use('/uploads', express.static(path.join(__dirname, '..', 'uploads')));
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
 
 // === API Routes ===
 app.use('/api/auth', authRoutes);
 app.use('/api/contact', contactRoutes);
 app.use('/api/profile', profileRoutes); // ✅ Mount profile routes
 app.use('/api/ai-search', productSearchRoutes);
-
+app.use('/api/selections', selectionRoutes);
 
 
 // === Fallback for undefined routes ===

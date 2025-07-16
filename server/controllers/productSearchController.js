@@ -1,7 +1,8 @@
+// controllers/productSearchController.js
 require('dotenv').config();
 const { CohereClient } = require("cohere-ai");
+const safeJsonParse = require('../utils/safeJsonParse');
 
-// Vérification stricte de la configuration
 if (!process.env.COHERE_API_KEY) {
   throw new Error("COHERE_API_KEY manquante dans le fichier .env");
 }
@@ -10,14 +11,27 @@ const cohere = new CohereClient({
   token: process.env.COHERE_API_KEY
 });
 
-exports.searchAIProducts = async (req, res) => {
-  let keyword = '';
+function safeJsonTruncate(str) {
+  const lastBrace = str.lastIndexOf('}');
+  const lastBracket = str.lastIndexOf(']');
+  const cutPos = Math.max(lastBrace, lastBracket);
+  if (cutPos === -1) return str;
 
+  let truncated = str.substring(0, cutPos + 1);
+  let quoteCount = (truncated.match(/"/g) || []).length;
+  while (quoteCount % 2 !== 0 && truncated.length > 0) {
+    truncated = truncated.slice(0, -1);
+    quoteCount = (truncated.match(/"/g) || []).length;
+  }
+
+  return truncated;
+}
+
+exports.searchAIProducts = async (req, res) => {
   try {
     const { category } = req.params;
-    keyword = req.query.keyword;
+    const keyword = req.query.keyword;
 
-    // ===== VALIDATION DES ENTREES =====
     if (!keyword || keyword.length < 2) {
       return res.status(400).json({
         error: "Le mot-clé doit contenir au moins 2 caractères",
@@ -34,106 +48,124 @@ exports.searchAIProducts = async (req, res) => {
       });
     }
 
-    // ===== CONSTRUCTION DU PROMPT =====
-    const prompt = `[INSTRUCTION STRICTE]
-Génère un tableau JSON de 15 produits réels pour "${keyword}" (catégorie: ${category}).
-Chaque produit doit avoir EXACTEMENT ces champs :
+const prompt = `[STRICT INSTRUCTION]
+Generate a JSON array of an obligatory of 30 real and new products for the keyword "${keyword}" (category: ${category}).
+Products must come exclusively from trusted sources other than Amazon, such as eBay, AliExpress, Walmart, BestBuy, CDiscount, Fnac, Rakuten, or others.
+Do not include any product from Amazon.
+Each product must have EXACTLY the following fields:
 - name (string)
-- price (string avec devise)
-- description (string < 80 caractères)
-- rating (number 0-5)
+- price (string with currency)
+- description (short string, max 80 characters) in clear and correct English
+- rating (number from 0 to 5)
 - supplier (string)
-- product_url (URL valide)
-- image_url (URL valide)
-- quantity (number 1-20)
+- product_url (valid URL to product page)
+- image_url (valid URL to product image)
+- quantity (number from 1 to 20)
+
+Important:
+- Avoid error pages (e.g., "Are you looking for something?")
+- Only return **real, active** products.
+- Return ONLY raw JSON with **no extra text**.
+- Include an image URL for each product.
 
 Format REQUIS :
-```json
-[
-  {
-    "name": "Nom produit",
-    "price": "XX.XX€",
-    "description": "Description courte",
-    "rating": 4.5,
-    "supplier": "Amazon",
-    "product_url": "https://example.com",
-    "image_url": "https://example.com/image.jpg",
-    "quantity": 5
-  }
-]```
+\`\`\`json
+[ { ... }, { ... } ]
+\`\`\``;
 
-Ne renvoie QUE le JSON sans aucun texte supplémentaire.`;
-
-    // ===== APPEL A L'API COHERE =====
     console.log("Envoi de la requête à Cohere...");
     const response = await cohere.generate({
       model: "command-r-plus",
-      prompt: prompt,
-      temperature: 0.3, // Réduit la créativité pour un JSON strict
-      maxTokens: 2500,
+      prompt,
+      temperature: 0.3,
+      maxTokens: 7000,
+      timeout: 80000,
     });
 
     const rawText = response.generations[0]?.text?.trim();
     console.log("Réponse brute de Cohere:", rawText);
 
-    // ===== TRAITEMENT DE LA REPONSE =====
+    let jsonBlock = rawText;
+    const jsonMatch = rawText.match(/```json\s*([\s\S]*?)\s*```/i);
+    if (jsonMatch) {
+      jsonBlock = jsonMatch[1];
+    }
+
+    jsonBlock = jsonBlock.replace(/[\u0000-\u001F\u007F-\u009F]/g, '').trim();
+    jsonBlock = safeJsonTruncate(jsonBlock);
+
     let products;
     try {
-      // Extraction du JSON uniquement
-      const jsonMatch = rawText.match(/```json\n([\s\S]*?)\n```/);
-      const jsonStr = jsonMatch ? jsonMatch[1] : rawText;
-      
-      products = JSON.parse(jsonStr);
-      
-      if (!Array.isArray(products)) {
-        throw new Error("La réponse n'est pas un tableau");
+      products = safeJsonParse(jsonBlock);
+      if (!products || !Array.isArray(products)) {
+        throw new Error("Format JSON invalide ou structure incorrecte");
       }
-    } catch (e) {
-      console.error("Erreur de parsing:", e);
-      console.debug("Contenu brut:", rawText);
-      throw new Error(`Format JSON invalide: ${e.message}`);
+    } catch (err) {
+      console.error("❌ Erreur de parsing JSON:", err.message);
+      console.debug("Contenu JSON brut:", jsonBlock);
+      throw new Error(`Format JSON invalide: ${err.message}`);
     }
 
-    // ===== VALIDATION ET TRANSFORMATION =====
-    const processedProducts = products
-      .filter(product => (
+    // Supprimer les doublons d'URL
+    const seenUrls = new Set();
+    const uniqueProducts = [];
+
+    for (const product of products) {
+      if (seenUrls.has(product.product_url)) continue;
+      seenUrls.add(product.product_url);
+      uniqueProducts.push(product);
+    }
+
+    const isValidProduct = (product) => {
+      const invalidAmazonUrl =
+        product.product_url.toLowerCase().includes("amazon") ||
+        product.product_url.includes("gp/aw") ||
+        product.product_url.includes("error") ||
+        product.product_url.includes("ap/signin") ||
+        product.product_url.includes("vous-cherchez-quelque-chose");
+
+      return (
         product?.name &&
-        product?.price && 
+        product?.price &&
         product?.description &&
         !isNaN(product?.rating) &&
-        product?.product_url?.startsWith('http') &&
-        product?.image_url?.startsWith('http')
-      ))
-      .slice(0, 15)
-      .map(product => ({
-        ...product,
-        rating: parseFloat(product.rating).toFixed(1),
-        // Si quantity n'est pas fournie, génère une valeur aléatoire
-        quantity: product.quantity || Math.floor(Math.random() * 10) + 1
-      }));
+        typeof product.product_url === 'string' &&
+        product.product_url.startsWith('http') &&
+        typeof product.image_url === 'string' &&
+        product.image_url.startsWith('http') &&
+        !invalidAmazonUrl &&
+        product.supplier.toLowerCase() !== 'amazon'
+      );
+    };
 
-    if (processedProducts.length === 0) {
-      throw new Error("Aucun produit valide trouvé dans la réponse");
+    const filteredProducts = uniqueProducts.filter(isValidProduct);
+
+    const finalProducts = filteredProducts.slice(0, 100).map(product => ({
+      ...product,
+      rating: parseFloat(product.rating).toFixed(1),
+      quantity: product.quantity || Math.floor(Math.random() * 20) + 1,
+    }));
+
+    if (finalProducts.length === 0) {
+      throw new Error("Aucun produit valide trouvé dans la réponse hors Amazon");
     }
 
-    // ===== REPONSE FINALE =====
     return res.json({
       success: true,
-      count: processedProducts.length,
-      products: processedProducts
+      count: finalProducts.length,
+      products: finalProducts
     });
 
   } catch (error) {
     console.error("[ERREUR FINALE]", error.message);
-    
-    // Mode dégradé avec mock
+
     const mockProducts = [{
-      name: `${keyword || 'Produit'} (exemple)`,
+      name: `${req.query.keyword || 'Produit'} (exemple)`,
       price: "99.99€",
       description: "Produit de démonstration - erreur API",
       rating: 4.0,
-      supplier: "Amazon",
-      product_url: "https://www.amazon.fr",
+      supplier: "Fournisseur Démo",
+      product_url: "https://www.example.com",
       image_url: "https://via.placeholder.com/150",
       quantity: 1
     }];
